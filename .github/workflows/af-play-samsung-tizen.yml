@@ -1,0 +1,748 @@
+name: AF Play Samsung Tizen
+
+on:
+  workflow_dispatch:
+    inputs:
+      playlist_url:
+        description: "Lista TV JSON/M3U implicita"
+        required: false
+        default: "https://acasatv.co/zxy.json"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: af-play-samsung-tizen-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build AF PLAY TV Samsung WGT
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    env:
+      PLAYLIST_URL: ${{ inputs.playlist_url || 'https://acasatv.co/zxy.json' }}
+      NUVIO_LOCAL_PROPERTIES: ${{ secrets.NUVIO_LOCAL_PROPERTIES }}
+      TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+
+    steps:
+      - name: Checkout NuvioTVSmart
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Prepare runtime properties
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -n "${NUVIO_LOCAL_PROPERTIES//[[:space:]]/}" ]; then
+            printf '%s\n' "$NUVIO_LOCAL_PROPERTIES" > local.properties
+          else
+            cp local.example.properties local.properties
+          fi
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import os, re
+
+          p = Path("local.properties")
+          s = p.read_text(encoding="utf-8")
+
+          key = os.environ.get("TMDB_API_KEY", "").strip()
+          if key:
+              if re.search(r"(?m)^TMDB_API_KEY=", s):
+                  s = re.sub(r"(?m)^TMDB_API_KEY=.*$", f"TMDB_API_KEY={key}", s)
+              else:
+                  s += f"\nTMDB_API_KEY={key}\n"
+
+          if re.search(r"(?m)^SIMKL_APP_NAME=", s):
+              s = re.sub(r"(?m)^SIMKL_APP_NAME=.*$", "SIMKL_APP_NAME=afplay", s)
+          else:
+              s += "\nSIMKL_APP_NAME=afplay\n"
+
+          p.write_text(s, encoding="utf-8")
+          PY
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Apply AF Play Samsung patch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+
+          ROOT = Path(".")
+          PLAYLIST_URL = os.environ.get("PLAYLIST_URL", "https://acasatv.co/zxy.json").strip()
+
+          def read(path):
+              return (ROOT / path).read_text(encoding="utf-8")
+
+          def write(path, text):
+              p = ROOT / path
+              p.parent.mkdir(parents=True, exist_ok=True)
+              p.write_text(text, encoding="utf-8")
+
+          def replace_once(path, old, new):
+              text = read(path)
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one anchor, found {count}: {old[:100]!r}")
+              write(path, text.replace(old, new, 1))
+
+          preset = r'''import { LocalStore } from "../core/storage/localStore.js";
+          import { PluginManager } from "../core/player/pluginManager.js";
+          import { addonRepository } from "../data/repository/addonRepository.js";
+          import { LayoutPreferences } from "../data/local/layoutPreferences.js";
+          import { PlayerSettingsStore } from "../data/local/playerSettingsStore.js";
+          import { ThemeStore } from "../data/local/themeStore.js";
+          import { TmdbSettingsStore } from "../data/local/tmdbSettingsStore.js";
+          import { TorrentSettingsStore } from "../data/local/torrentSettingsStore.js";
+
+          const DEFAULT_ADDONS = [
+            "https://opensubtitles-v3.strem.io/manifest.json",
+            "https://opensubtitlesv3-pro.dexter21767.com/manifest.json",
+            "https://2ecbbd610840-opensubtitles.baby-beamup.club/manifest.json",
+            "https://subdl.strem.top/manifest.json",
+            "https://v3-cinemeta.strem.io/manifest.json",
+            "https://94c8cb9f702d-tmdb-addon.baby-beamup.club/manifest.json",
+            "https://aiostreams.elfhosted.com/stremio/manifest.json",
+            "https://torrentio.strem.fun/manifest.json",
+            "https://thepiratebay-plus.strem.fun/manifest.json",
+            "https://torrentio.strem.fun/language=romanian,italian/manifest.json"
+          ];
+
+          const DEFAULT_PLUGIN_REPOS = [
+            "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/manifest.json",
+            "https://cynex.acasatv.co/manifest.json",
+            "https://raw.githubusercontent.com/niakw/Niakvio/refs/heads/main/manifest.json"
+          ];
+
+          const CORE_VERSION = 1;
+          const PLUGIN_VERSION = 1;
+
+          function key(profileId) {
+            return `afPlaySamsungPreset:${String(profileId || "1")}`;
+          }
+
+          function state(profileId) {
+            const value = LocalStore.get(key(profileId), {});
+            return value && typeof value === "object" ? value : {};
+          }
+
+          function save(profileId, partial) {
+            LocalStore.set(key(profileId), { ...state(profileId), ...partial });
+          }
+
+          async function seedAddons() {
+            for (const url of DEFAULT_ADDONS) {
+              try {
+                await addonRepository.addAddon(url);
+              } catch (error) {
+                console.warn("AF Play addon seed failed", url, error);
+              }
+            }
+
+            const current = addonRepository.getInstalledAddonUrls();
+            const wanted = DEFAULT_ADDONS.map((url) => addonRepository.canonicalizeUrl(url));
+            const wantedKeys = new Set(wanted.map((url) => String(url).toLowerCase()));
+            const extras = current.filter((url) => !wantedKeys.has(String(url).toLowerCase()));
+
+            try {
+              await addonRepository.setAddonOrder([...wanted, ...extras], { allowReadOnly: true });
+            } catch (error) {
+              console.warn("AF Play addon order failed", error);
+            }
+          }
+
+          function seedSettings(profileId) {
+            PlayerSettingsStore.setForProfile(profileId, {
+              subtitleLanguage: "ro",
+              secondarySubtitleLanguage: "it",
+              preferredAudioLanguage: "en",
+              secondaryPreferredAudioLanguage: "it",
+              trailerAutoplay: true,
+              trailerDelaySeconds: 4,
+              subtitlesEnabled: true,
+              subtitleStyle: {
+                preferredLanguage: "ro",
+                secondaryPreferredLanguage: "it",
+                useForcedSubtitles: false,
+                showOnlyPreferredLanguages: false,
+                outlineEnabled: true
+              }
+            });
+
+            ThemeStore.setForProfile(profileId, {
+              themeName: "AMBER",
+              accentColor: "#fb8c00"
+            });
+
+            TmdbSettingsStore.setForProfile(profileId, {
+              enabled: true,
+              modernHomeEnabled: true,
+              enrichContinueWatching: true,
+              language: "ro",
+              useArtwork: true,
+              useBasicInfo: true,
+              useDetails: true,
+              useReleaseDates: true,
+              useCredits: true,
+              useProductions: true,
+              useNetworks: true,
+              useEpisodes: true,
+              useTrailers: true,
+              useMoreLikeThis: true,
+              useCollections: true
+            });
+
+            LayoutPreferences.setForProfile(profileId, {
+              hasChosenLayout: true,
+              homeLayout: "modern",
+              modernSidebar: true,
+              modernSidebarBlur: true,
+              fastHorizontalNavigationEnabled: true,
+              focusedPosterBackdropExpandEnabled: true,
+              focusedPosterBackdropExpandDelaySeconds: 1,
+              focusedPosterBackdropTrailerEnabled: true,
+              focusedPosterBackdropTrailerMuted: true,
+              focusedPosterBackdropTrailerPlaybackTarget: "expanded_card",
+              cardDepthEnabled: true,
+              detailPageTrailerButtonEnabled: true,
+              homeImdbRatingsVisibility: "SHOW_ALL"
+            });
+
+            TorrentSettingsStore.setForProfile(profileId, {
+              p2pEnabled: true,
+              enableUpload: true
+            });
+          }
+
+          async function seedPlugins() {
+            PluginManager.setPluginsEnabled(true);
+            PluginManager.setGroupStreamsByRepository(true);
+
+            let ok = true;
+            for (const url of DEFAULT_PLUGIN_REPOS) {
+              try {
+                await PluginManager.addRepository(url);
+              } catch (error) {
+                ok = false;
+                console.warn("AF Play plugin repository seed failed", url, error);
+              }
+            }
+            return ok;
+          }
+
+          export const AfPlayPreset = {
+            async applyForProfile(profileId = "1") {
+              const id = String(profileId || "1");
+              const current = state(id);
+
+              if (Number(current.coreVersion || 0) < CORE_VERSION) {
+                seedSettings(id);
+                await seedAddons();
+                save(id, { coreVersion: CORE_VERSION });
+              }
+
+              if (Number(current.pluginVersion || 0) < PLUGIN_VERSION) {
+                if (await seedPlugins()) {
+                  save(id, { pluginVersion: PLUGIN_VERSION });
+                }
+              }
+            }
+          };
+          '''
+          preset = "\n".join(line[10:] if line.startswith("          ") else line for line in preset.splitlines()) + "\n"
+          write("js/afplay/afPlayPreset.js", preset)
+
+          replace_once(
+              "js/app.js",
+              'import { PluginRuntime } from "./core/player/pluginRuntime.js";\n',
+              'import { PluginRuntime } from "./core/player/pluginRuntime.js";\n'
+              'import { AfPlayPreset } from "./afplay/afPlayPreset.js";\n'
+          )
+
+          replace_once(
+              "js/app.js",
+              '    await ProfileManager.setActiveProfile(activeProfile.id);\n'
+              '    StartupSyncService.enableProfileScopedSync();',
+              '    await ProfileManager.setActiveProfile(activeProfile.id);\n'
+              '    try {\n'
+              '      await AfPlayPreset.applyForProfile(activeProfile.id);\n'
+              '    } catch (error) {\n'
+              '      console.warn("AF Play preset failed", error);\n'
+              '    }\n'
+              '    StartupSyncService.enableProfileScopedSync();'
+          )
+
+          live_tv = r'''import { Router } from "../../navigation/router.js";
+          import { ScreenUtils } from "../../navigation/screen.js";
+
+          const DEFAULT_PLAYLIST_URL = __PLAYLIST_URL__;
+          const CUSTOM_PLAYLIST_KEY = "afPlaySamsungCustomPlaylist";
+
+          function escapeHtml(value = "") {
+            return String(value)
+              .replace(/&/g, "&amp;")
+              .replace(/</g, "&lt;")
+              .replace(/>/g, "&gt;")
+              .replace(/"/g, "&quot;")
+              .replace(/'/g, "&#039;");
+          }
+
+          function attr(line, key) {
+            const match = String(line || "").match(new RegExp(`${key}="([^"]*)"`, "i"));
+            return match ? match[1] : "";
+          }
+
+          function qualityScore(value = "") {
+            const q = String(value || "").toLowerCase();
+            if (q.includes("4k") || q.includes("uhd") || q.includes("2160")) return 500;
+            if (q.includes("1080") || q.includes("fhd")) return 400;
+            if (q.includes("720") || q === "hd" || q.includes(" hd")) return 300;
+            if (q.includes("576") || q.includes("480")) return 200;
+            if (q.includes("sd")) return 100;
+            return 50;
+          }
+
+          function bestLink(links = []) {
+            return [...(Array.isArray(links) ? links : [])]
+              .filter((link) => /^https?:\/\//i.test(String(link?.url || "")))
+              .sort((a, b) => qualityScore(b?.quality) - qualityScore(a?.quality))[0] || null;
+          }
+
+          function parseJsonPlaylist(text) {
+            const root = JSON.parse(text);
+            const channels = Array.isArray(root) ? root : Array.isArray(root.channels) ? root.channels : [];
+            const categoryById = {};
+
+            if (root && Array.isArray(root.categories)) {
+              root.categories.forEach((category) => {
+                const title = String(category?.title || category?.name || "").trim();
+                const ids = Array.isArray(category?.channelIds) ? category.channelIds : [];
+                if (!title) return;
+                ids.forEach((id) => { categoryById[String(id)] = title; });
+              });
+            }
+
+            return channels.map((channel, index) => {
+              const id = String(channel.id ?? channel.channelId ?? `json-${index}`);
+              const name = String(channel.channelName || channel.name || `Canal ${index + 1}`).trim();
+              const logo = String(channel.channelImage || channel.logo || "").trim();
+              const categories = Array.isArray(channel.categories) ? channel.categories : [];
+              const group = String(
+                categoryById[id] ||
+                categories.find(Boolean) ||
+                channel.category ||
+                channel.group ||
+                channel.groupTitle ||
+                "Altele"
+              ).trim() || "Altele";
+
+              const rawLinks = Array.isArray(channel.channelLinks)
+                ? channel.channelLinks
+                : Array.isArray(channel.links)
+                  ? channel.links
+                  : channel.url
+                    ? [{ url: channel.url, quality: channel.quality || "Auto" }]
+                    : [];
+
+              const links = rawLinks.map((link) =>
+                typeof link === "string"
+                  ? { url: link, quality: "Auto", contentHost: "" }
+                  : {
+                      url: String(link?.url || "").trim(),
+                      quality: String(link?.quality || "Auto").trim(),
+                      contentHost: String(link?.contentHost || link?.host || "").trim()
+                    }
+              ).filter((link) => /^https?:\/\//i.test(link.url))
+               .sort((a, b) => qualityScore(b.quality) - qualityScore(a.quality));
+
+              return links.length ? { id, name, logo, group, links } : null;
+            }).filter(Boolean);
+          }
+
+          function parseM3uPlaylist(text) {
+            const channels = [];
+            let name = "";
+            let logo = "";
+            let group = "Altele";
+            let index = 0;
+
+            String(text || "").split(/\r?\n/).forEach((rawLine) => {
+              const line = rawLine.trim();
+              if (!line) return;
+
+              if (/^#EXTINF/i.test(line)) {
+                name = line.includes(",") ? line.slice(line.lastIndexOf(",") + 1).trim() : `Canal ${index + 1}`;
+                logo = attr(line, "tvg-logo");
+                group = attr(line, "group-title") || "Altele";
+                return;
+              }
+
+              if (!line.startsWith("#") && /^https?:\/\//i.test(line)) {
+                channels.push({
+                  id: `m3u-${index++}`,
+                  name: name || `Canal ${index}`,
+                  logo,
+                  group,
+                  links: [{ url: line, quality: "Auto", contentHost: "" }]
+                });
+                name = "";
+                logo = "";
+                group = "Altele";
+              }
+            });
+            return channels;
+          }
+
+          function parsePlaylist(text) {
+            const clean = String(text || "").trim();
+            if (!clean) return [];
+            return clean.startsWith("{") || clean.startsWith("[")
+              ? parseJsonPlaylist(clean)
+              : parseM3uPlaylist(clean);
+          }
+
+          function categoryPriority(name = "") {
+            const value = String(name || "").toLowerCase();
+            if (value.includes("general") || value.includes("stiri") || value.includes("știri") || value.includes("news")) return 0;
+            if (value.includes("sport")) return 1;
+            if (value.includes("premium")) return 2;
+            if (value.includes("film")) return 3;
+            if (value.includes("serial") || value.includes("emisi")) return 4;
+            if (value.includes("educ")) return 5;
+            if (value.includes("copii") || value.includes("kids")) return 6;
+            if (value.includes("muz")) return 7;
+            if (value.includes("lifestyle")) return 8;
+            if (value.includes("relig")) return 9;
+            if (value.includes("intern")) return 10;
+            return 20;
+          }
+
+          function focusNode(container, node) {
+            if (!node) return;
+            container.querySelectorAll(".focusable.focused").forEach((item) => item.classList.remove("focused"));
+            node.classList.add("focused");
+            try { node.focus({ preventScroll: false }); } catch (_) { node.focus(); }
+            node.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+          }
+
+          export const LiveTvScreen = {
+            container: null,
+            channels: [],
+            selectedGroup: "Toate",
+            status: "",
+            keyHandler: null,
+
+            async mount() {
+              this.container = document.getElementById("liveTv");
+              ScreenUtils.show(this.container);
+              this.status = "Se incarca lista TV...";
+              this.render();
+
+              try {
+                const custom = localStorage.getItem(CUSTOM_PLAYLIST_KEY);
+                const text = custom || await (await fetch(DEFAULT_PLAYLIST_URL, { cache: "no-store" })).text();
+                this.channels = parsePlaylist(text);
+                this.status = `${this.channels.length} canale`;
+              } catch (error) {
+                console.warn("AF Play Live TV load failed", error);
+                this.channels = [];
+                this.status = "Lista TV nu este disponibila.";
+              }
+
+              this.render();
+              this.bindKeys();
+              requestAnimationFrame(() => focusNode(this.container, this.container.querySelector(".focusable")));
+            },
+
+            cleanup() {
+              if (this.keyHandler) document.removeEventListener("keydown", this.keyHandler, true);
+              this.keyHandler = null;
+              ScreenUtils.hide(this.container);
+              this.container = null;
+            },
+
+            groups() {
+              return ["Toate", ...[...new Set(this.channels.map((channel) => channel.group).filter(Boolean))]
+                .sort((a, b) => categoryPriority(a) - categoryPriority(b) || a.localeCompare(b))];
+            },
+
+            visible() {
+              return this.selectedGroup === "Toate"
+                ? this.channels
+                : this.channels.filter((channel) => channel.group === this.selectedGroup);
+            },
+
+            play(channel) {
+              const selected = bestLink(channel.links);
+              if (!selected) return;
+              const candidates = channel.links.map((link, index) => ({
+                id: `${channel.id}:${index}`,
+                url: link.url,
+                name: `${channel.name} - ${link.quality || "Auto"}`,
+                title: `${channel.name} - ${link.quality || "Auto"}`,
+                addonName: link.contentHost || "AF Play TV"
+              }));
+
+              Router.navigate("player", {
+                streamUrl: selected.url,
+                itemId: `livetv:${channel.id}`,
+                itemType: "live",
+                videoId: `livetv:${channel.id}`,
+                playerTitle: channel.name,
+                playerSubtitle: channel.group,
+                streamCandidates: candidates,
+                preferredStreamId: candidates.find((item) => item.url === selected.url)?.id || candidates[0]?.id || "",
+                returnToStreamOnBack: false,
+                returnToHomeOnBack: false
+              });
+            },
+
+            render() {
+              if (!this.container) return;
+              const groups = this.groups();
+              const visible = this.visible();
+
+              this.container.innerHTML = `
+                <div class="af-tv-shell">
+                  <header class="af-tv-header">
+                    <div>
+                      <div class="af-tv-eyebrow">AF PLAY TV</div>
+                      <h1>TV</h1>
+                      <p>${escapeHtml(this.status)}</p>
+                    </div>
+                    <div class="af-tv-actions">
+                      <button class="af-tv-action focusable" data-action="online">Lista online</button>
+                    </div>
+                  </header>
+
+                  <div class="af-tv-groups">
+                    ${groups.map((group) => `
+                      <button class="af-tv-group focusable${group === this.selectedGroup ? " selected" : ""}"
+                              data-action="group" data-group="${escapeHtml(group)}">${escapeHtml(group)}</button>
+                    `).join("")}
+                  </div>
+
+                  <div class="af-tv-grid">
+                    ${visible.map((channel) => {
+                      const link = bestLink(channel.links);
+                      return `
+                        <button class="af-tv-card focusable" data-action="play" data-id="${escapeHtml(channel.id)}">
+                          <span class="af-tv-logo-wrap">
+                            ${channel.logo ? `<img src="${escapeHtml(channel.logo)}" alt="" loading="lazy" />` : `<span class="af-tv-logo-fallback">TV</span>`}
+                          </span>
+                          <span class="af-tv-card-copy">
+                            <strong>${escapeHtml(channel.name)}</strong>
+                            <small>${escapeHtml(channel.group)} · ${escapeHtml(link?.quality || "Auto")}</small>
+                          </span>
+                        </button>
+                      `;
+                    }).join("")}
+                  </div>
+                </div>
+              `;
+
+              this.container.querySelectorAll("[data-action='group']").forEach((node) => {
+                node.onclick = () => {
+                  this.selectedGroup = node.dataset.group || "Toate";
+                  this.render();
+                  requestAnimationFrame(() => focusNode(this.container, this.container.querySelector(".af-tv-group.selected")));
+                };
+              });
+
+              this.container.querySelectorAll("[data-action='play']").forEach((node) => {
+                node.onclick = () => {
+                  const channel = this.channels.find((item) => String(item.id) === String(node.dataset.id));
+                  if (channel) this.play(channel);
+                };
+              });
+
+              this.container.querySelector("[data-action='online']")?.addEventListener("click", async () => {
+                localStorage.removeItem(CUSTOM_PLAYLIST_KEY);
+                this.status = "Se incarca lista TV...";
+                this.render();
+                try {
+                  const response = await fetch(DEFAULT_PLAYLIST_URL, { cache: "no-store" });
+                  this.channels = parsePlaylist(await response.text());
+                  this.selectedGroup = "Toate";
+                  this.status = `${this.channels.length} canale`;
+                } catch (_) {
+                  this.channels = [];
+                  this.status = "Lista TV nu este disponibila.";
+                }
+                this.render();
+              });
+
+              ScreenUtils.indexFocusables(this.container);
+            },
+
+            bindKeys() {
+              this.keyHandler = (event) => {
+                if (Router.getCurrent() !== "liveTv") return;
+                const code = Number(event?.keyCode || 0);
+                if ([8, 27, 461, 10009].includes(code)) {
+                  event.preventDefault?.();
+                  Router.back();
+                  return;
+                }
+                if ([37, 38, 39, 40].includes(code)) {
+                  event.preventDefault?.();
+                  ScreenUtils.handleDpadNavigation(event, this.container);
+                  return;
+                }
+                if ([13, 23].includes(code)) {
+                  const node = this.container.querySelector(".focusable.focused") || document.activeElement;
+                  if (node?.click) {
+                    event.preventDefault?.();
+                    node.click();
+                  }
+                }
+              };
+              document.addEventListener("keydown", this.keyHandler, true);
+            }
+          };
+          '''
+          live_tv = "\n".join(line[10:] if line.startswith("          ") else line for line in live_tv.splitlines()) + "\n"
+          live_tv = live_tv.replace("__PLAYLIST_URL__", repr(PLAYLIST_URL))
+          write("js/ui/screens/livetv/liveTvScreen.js", live_tv)
+
+          replace_once(
+              "js/bootstrap/renderAppShell.js",
+              '    <div id="library" class="screen"></div>\n    <div id="search" class="screen"></div>',
+              '    <div id="library" class="screen"></div>\n    <div id="liveTv" class="screen"></div>\n    <div id="search" class="screen"></div>'
+          )
+
+          replace_once(
+              "js/ui/navigation/router.js",
+              'import { LibraryScreen } from "../screens/library/libraryScreen.js";\n',
+              'import { LibraryScreen } from "../screens/library/libraryScreen.js";\nimport { LiveTvScreen } from "../screens/livetv/liveTvScreen.js";\n'
+          )
+
+          replace_once(
+              "js/ui/navigation/router.js",
+              '    library: LibraryScreen,\n    search: SearchScreen,',
+              '    library: LibraryScreen,\n    liveTv: LiveTvScreen,\n    search: SearchScreen,'
+          )
+
+          sidebar_path = "js/ui/components/sidebarNavigation.js"
+          sidebar = read(sidebar_path)
+          settings_anchor = '''  {
+            action: "gotoSettings",
+            route: "settings",
+            labelKey: "sidebar.settings",
+          '''
+          tv_item = '''  {
+            action: "gotoLiveTv",
+            route: "liveTv",
+            label: "TV",
+            iconType: "svg",
+            viewBox: "0 0 24 24",
+            iconMarkup:
+              '<path d="M4 5h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-6v2h-4v-2H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Zm0 2v10h16V7H4Zm4 2.2 7 2.8-7 2.8V9.2Z"/>'
+          },
+          '''
+          if settings_anchor not in sidebar:
+              raise SystemExit("Sidebar Settings anchor missing")
+          sidebar = sidebar.replace(settings_anchor, tv_item + settings_anchor, 1)
+          write(sidebar_path, sidebar)
+
+          replace_once(
+              sidebar_path,
+              'function itemLabel(item) {\n  return t(item?.labelKey, {}, String(item?.label || item?.route || ""));\n}',
+              'function itemLabel(item) {\n  if (!item?.labelKey) return String(item?.label || item?.route || "");\n  return t(item.labelKey, {}, String(item?.label || item?.route || ""));\n}'
+          )
+
+          css_path = "css/components.css"
+          css = read(css_path)
+          css += r'''
+
+          #liveTv { background:#090909; color:#fff; min-height:100vh; }
+          .af-tv-shell { box-sizing:border-box; min-height:1080px; padding:54px 64px 72px; }
+          .af-tv-header { display:flex; justify-content:space-between; align-items:flex-end; margin-bottom:28px; }
+          .af-tv-header h1 { margin:2px 0 4px; font-size:54px; line-height:1; }
+          .af-tv-header p { margin:0; color:rgba(255,255,255,.62); font-size:22px; }
+          .af-tv-eyebrow { color:#fb8c00; font-size:18px; font-weight:800; letter-spacing:.14em; }
+          .af-tv-actions,.af-tv-groups { display:flex; gap:12px; }
+          .af-tv-groups { overflow-x:auto; padding:6px 4px 18px; }
+          .af-tv-action,.af-tv-group { border:1px solid rgba(255,255,255,.14); background:rgba(255,255,255,.07); color:#fff; border-radius:14px; min-height:54px; padding:0 22px; font-size:20px; }
+          .af-tv-group.selected { background:#fb8c00; color:#0b0b0b; border-color:#fb8c00; font-weight:800; }
+          .af-tv-grid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:16px; }
+          .af-tv-card { display:flex; align-items:center; gap:16px; min-height:112px; padding:15px 17px; border-radius:18px; border:1px solid rgba(255,255,255,.1); background:rgba(22,22,22,.92); color:#fff; text-align:left; overflow:hidden; }
+          .af-tv-logo-wrap { flex:0 0 70px; width:70px; height:70px; display:flex; align-items:center; justify-content:center; border-radius:14px; background:#050505; overflow:hidden; }
+          .af-tv-logo-wrap img { max-width:90%; max-height:90%; object-fit:contain; }
+          .af-tv-logo-fallback { color:#fb8c00; font-weight:900; }
+          .af-tv-card-copy { min-width:0; display:flex; flex-direction:column; gap:7px; }
+          .af-tv-card-copy strong,.af-tv-card-copy small { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+          .af-tv-card-copy strong { font-size:21px; }
+          .af-tv-card-copy small { color:rgba(255,255,255,.58); font-size:16px; }
+          .af-tv-action.focused,.af-tv-group.focused,.af-tv-card.focused,.af-tv-action:focus,.af-tv-group:focus,.af-tv-card:focus { outline:4px solid #fb8c00 !important; outline-offset:2px; transform:scale(1.035); border-color:#fb8c00; z-index:2; }
+          '''
+          css = "\n".join(line[10:] if line.startswith("          ") else line for line in css.splitlines()) + "\n"
+          write(css_path, css)
+
+          replace_once(
+              "scripts/package-tizen.mjs",
+              'const appName = "Nuvio TV";\nconst defaultTizenPackageId = "NuvioTV001";\nconst defaultTizenAppId = "NuvioTV001.NuvioTV";',
+              'const appName = "AF PLAY TV";\nconst defaultTizenPackageId = "AFPlayTV01";\nconst defaultTizenAppId = "AFPlayTV01.AFPlayTV";'
+          )
+
+          replace_once("index.html", "<title>Nuvio TV</title>", "<title>AF PLAY TV</title>")
+
+          print("AF Play Samsung patch applied")
+          PY
+
+      - name: Verify patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -F 'All-in-One-Nuvio' js/afplay/afPlayPreset.js
+          grep -F 'torrentio.strem.fun' js/afplay/afPlayPreset.js
+          grep -F 'opensubtitles-v3.strem.io' js/afplay/afPlayPreset.js
+          grep -F 'cynex.acasatv.co' js/afplay/afPlayPreset.js
+          grep -F 'niakw/Niakvio' js/afplay/afPlayPreset.js
+          grep -F 'liveTv: LiveTvScreen' js/ui/navigation/router.js
+          grep -F "$PLAYLIST_URL" js/ui/screens/livetv/liveTvScreen.js
+          grep -F 'AF PLAY TV' scripts/package-tizen.mjs
+
+      - name: Build Samsung Tizen WGT
+        env:
+          NUVIO_REQUIRE_LOCAL_PROPERTIES: "1"
+          TIZEN_INCLUDE_ENGINEFS_SERVICE: "1"
+          TIZEN_INCLUDE_PLUGIN_SERVICE: "1"
+        run: npm run package:tizen
+
+      - name: Collect WGT
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          WGT="$(find . -maxdepth 1 -type f -name 'AFPlayTV01_*.wgt' | head -n 1)"
+          test -n "$WGT"
+          cp "$WGT" out/AF-PLAY-TV-Samsung-Tizen.wgt
+          sha256sum out/AF-PLAY-TV-Samsung-Tizen.wgt > out/SHA256SUMS.txt
+          ls -lh out/
+
+      - name: Upload Samsung package
+        uses: actions/upload-artifact@v4
+        with:
+          name: AF-PLAY-TV-Samsung-Tizen
+          path: |
+            out/AF-PLAY-TV-Samsung-Tizen.wgt
+            out/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
