@@ -1,0 +1,844 @@
+name: AF Play Samsung Tizen v3
+
+on:
+  workflow_dispatch:
+    inputs:
+      playlist_url:
+        description: "Lista TV JSON/M3U implicita"
+        required: false
+        default: "https://acasatv.co/zxy.json"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: af-play-samsung-tizen-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build AF PLAY TV Samsung WGT
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    env:
+      PLAYLIST_URL: ${{ inputs.playlist_url || 'https://acasatv.co/zxy.json' }}
+      NUVIO_LOCAL_PROPERTIES: ${{ secrets.NUVIO_LOCAL_PROPERTIES }}
+      TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+
+    steps:
+      - name: Checkout NuvioTVSmart
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Prepare runtime properties
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -n "${NUVIO_LOCAL_PROPERTIES//[[:space:]]/}" ]; then
+            printf '%s\n' "$NUVIO_LOCAL_PROPERTIES" > local.properties
+          else
+            cp local.example.properties local.properties
+          fi
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import os, re
+
+          p = Path("local.properties")
+          s = p.read_text(encoding="utf-8")
+
+          key = os.environ.get("TMDB_API_KEY", "").strip()
+          if key:
+              if re.search(r"(?m)^TMDB_API_KEY=", s):
+                  s = re.sub(r"(?m)^TMDB_API_KEY=.*$", f"TMDB_API_KEY={key}", s)
+              else:
+                  s += f"\nTMDB_API_KEY={key}\n"
+
+          if re.search(r"(?m)^SIMKL_APP_NAME=", s):
+              s = re.sub(r"(?m)^SIMKL_APP_NAME=.*$", "SIMKL_APP_NAME=afplay", s)
+          else:
+              s += "\nSIMKL_APP_NAME=afplay\n"
+
+          p.write_text(s, encoding="utf-8")
+          PY
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Apply AF Play Samsung patch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+
+          ROOT = Path(".")
+          PLAYLIST_URL = os.environ.get("PLAYLIST_URL", "https://acasatv.co/zxy.json").strip()
+
+          def read(path):
+              return (ROOT / path).read_text(encoding="utf-8")
+
+          def write(path, text):
+              p = ROOT / path
+              p.parent.mkdir(parents=True, exist_ok=True)
+              p.write_text(text, encoding="utf-8")
+
+          def replace_once(path, old, new):
+              text = read(path)
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one anchor, found {count}: {old[:100]!r}")
+              write(path, text.replace(old, new, 1))
+
+          preset = r'''import { LocalStore } from "../core/storage/localStore.js";
+          import { PluginManager } from "../core/player/pluginManager.js";
+          import { addonRepository } from "../data/repository/addonRepository.js";
+          import { LayoutPreferences } from "../data/local/layoutPreferences.js";
+          import { PlayerSettingsStore } from "../data/local/playerSettingsStore.js";
+          import { ThemeStore } from "../data/local/themeStore.js";
+          import { TmdbSettingsStore } from "../data/local/tmdbSettingsStore.js";
+          import { TorrentSettingsStore } from "../data/local/torrentSettingsStore.js";
+          
+          const DEFAULT_ADDONS = [
+            "https://opensubtitles-v3.strem.io/manifest.json",
+            "https://opensubtitlesv3-pro.dexter21767.com/manifest.json",
+            "https://2ecbbd610840-opensubtitles.baby-beamup.club/manifest.json",
+            "https://subdl.strem.top/manifest.json",
+            "https://v3-cinemeta.strem.io/manifest.json",
+            "https://94c8cb9f702d-tmdb-addon.baby-beamup.club/manifest.json",
+            "https://torrentio.strem.fun/manifest.json",
+            "https://thepiratebay-plus.strem.fun/manifest.json",
+            "https://torrentio.strem.fun/language=romanian,italian/manifest.json"
+          ];
+          const DEFAULT_PLUGIN_REPOS = [
+            "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/manifest.json",
+            "https://cynex.acasatv.co/manifest.json",
+            "https://raw.githubusercontent.com/niakw/Niakvio/refs/heads/main/manifest.json"
+          ];
+          const CORE_VERSION = 3;
+          
+          function canonicalAddonUrl(url) {
+            return String(url || "").trim().replace(/\/manifest\.json(?:\?.*)?$/i, "").replace(/\/+$/, "");
+          }
+          function readEnvelope(key) {
+            const value = LocalStore.get(key, null);
+            if (value && typeof value === "object" && value.__profileScoped === true &&
+                Number(value.version || 0) === 1 && value.profiles && typeof value.profiles === "object") {
+              return value;
+            }
+            return { __profileScoped: true, version: 1, profiles: {} };
+          }
+          function writeAddonDefaults(profileId = "1") {
+            const id = String(profileId || "1");
+            const wanted = DEFAULT_ADDONS.map(canonicalAddonUrl);
+            const urlsEnvelope = readEnvelope("installedAddonUrls");
+            const existingUrls = Array.isArray(urlsEnvelope.profiles[id]) ? urlsEnvelope.profiles[id] : [];
+            const mergedUrls = [];
+            const seen = new Set();
+            [...wanted, ...existingUrls].forEach((url) => {
+              const clean = canonicalAddonUrl(url);
+              const key = clean.toLowerCase();
+              if (!clean || seen.has(key)) return;
+              seen.add(key);
+              mergedUrls.push(clean);
+            });
+            urlsEnvelope.profiles[id] = mergedUrls;
+            LocalStore.set("installedAddonUrls", urlsEnvelope);
+          
+            const enabledEnvelope = readEnvelope("installedAddonEnabledStates");
+            const currentStates = enabledEnvelope.profiles[id] && typeof enabledEnvelope.profiles[id] === "object" &&
+              !Array.isArray(enabledEnvelope.profiles[id]) ? enabledEnvelope.profiles[id] : {};
+            const nextStates = { ...currentStates };
+            wanted.forEach((url) => { nextStates[url] = true; });
+            enabledEnvelope.profiles[id] = nextStates;
+            LocalStore.set("installedAddonEnabledStates", enabledEnvelope);
+          }
+          function seedSettings(profileId = "1") {
+            const id = String(profileId || "1");
+            const versionKey = `afPlaySamsungCoreVersion:${id}`;
+            if (Number(LocalStore.get(versionKey, 0) || 0) >= CORE_VERSION) return;
+          
+            PlayerSettingsStore.setForProfile(id, {
+              subtitleLanguage: "ro",
+              secondarySubtitleLanguage: "it",
+              preferredAudioLanguage: "device",
+              secondaryPreferredAudioLanguage: "it",
+              trailerAutoplay: true,
+              trailerDelaySeconds: 4,
+              subtitlesEnabled: true,
+              subtitleStyle: {
+                preferredLanguage: "ro",
+                secondaryPreferredLanguage: "it",
+                useForcedSubtitles: false,
+                showOnlyPreferredLanguages: false,
+                outlineEnabled: true,
+                outlineColor: "#000000"
+              }
+            }, { silentSync: true });
+          
+            ThemeStore.setForProfile(id, { themeName: "ROSE", accentColor: "#d81b60" }, { silentSync: true });
+            TmdbSettingsStore.setForProfile(id, {
+              enabled: true, modernHomeEnabled: true, enrichContinueWatching: true, language: "ro",
+              useArtwork: true, useBasicInfo: true, useDetails: true, useReleaseDates: true,
+              useCredits: true, useProductions: true, useNetworks: true, useEpisodes: true,
+              useTrailers: true, useMoreLikeThis: true, useCollections: true
+            }, { silentSync: true });
+            LayoutPreferences.setForProfile(id, {
+              hasChosenLayout: true, homeLayout: "modern", modernSidebar: true, modernSidebarBlur: true,
+              fastHorizontalNavigationEnabled: true, focusedPosterBackdropExpandEnabled: true,
+              focusedPosterBackdropExpandDelaySeconds: 1, focusedPosterBackdropTrailerEnabled: false,
+              cardDepthEnabled: true, detailPageTrailerButtonEnabled: true,
+              homeImdbRatingsVisibility: "SHOW_ALL"
+            }, { silentSync: true });
+            TorrentSettingsStore.setForProfile(id, {
+              p2pEnabled: true, enableUpload: true, hideTorrentStats: true
+            }, { silentSync: true });
+          
+            LocalStore.set(versionKey, CORE_VERSION);
+          }
+          async function ensureAddons() {
+            for (const url of DEFAULT_ADDONS) {
+              try { await addonRepository.addAddon(url); }
+              catch (error) { console.warn("AF Play addon ensure failed", url, error); }
+            }
+            try {
+              const wanted = DEFAULT_ADDONS.map((url) => addonRepository.canonicalizeUrl(url));
+              const current = addonRepository.getInstalledAddonUrls();
+              const wantedKeys = new Set(wanted.map((url) => String(url).toLowerCase()));
+              const extras = current.filter((url) => !wantedKeys.has(String(url).toLowerCase()));
+              await addonRepository.setAddonOrder([...wanted, ...extras], { allowReadOnly: true });
+            } catch (error) { console.warn("AF Play addon order failed", error); }
+          }
+          async function ensurePlugins() {
+            PluginManager.setPluginsEnabled(true);
+            PluginManager.setGroupStreamsByRepository(true);
+            for (const url of DEFAULT_PLUGIN_REPOS) {
+              try {
+                const key = String(url).toLowerCase().replace(/\/+$/, "");
+                let repository = PluginManager.listRepositories().find(
+                  (repo) => String(repo?.url || "").toLowerCase().replace(/\/+$/, "") === key
+                );
+                if (!repository) repository = await PluginManager.addRepository(url);
+                if (repository?.id) await PluginManager.refreshRepository(repository.id).catch(() => null);
+              } catch (error) { console.warn("AF Play plugin repository ensure failed", url, error); }
+            }
+          }
+          export const AfPlayPreset = {
+            seedLocalDefaults(profileId = "1") {
+              writeAddonDefaults(profileId);
+              seedSettings(profileId);
+            },
+            async ensureNetworkSources() {
+              await ensureAddons();
+              await ensurePlugins();
+            }
+          };
+          '''
+          preset = "\n".join(line[10:] if line.startswith("          ") else line for line in preset.splitlines()) + "\n"
+          write("js/afplay/afPlayPreset.js", preset)
+
+          activation = r'''const API_BASE = "https://afplay-gateway.smar7y.workers.dev";
+          const KEY_DEVICE = "afplay_activation_device_id";
+          const KEY_TOKEN = "afplay_activation_token";
+          const KEY_LAST_CHECK = "afplay_activation_last_check";
+          const CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000;
+          const OFFLINE_GRACE_MS = 72 * 60 * 60 * 1000;
+          
+          function randomDeviceId() {
+            try { if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID().replace(/-/g, ""); } catch (_) {}
+            return `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`
+              .replace(/[^a-z0-9]/gi, "").slice(0, 32);
+          }
+          function getDeviceId() {
+            let value = String(localStorage.getItem(KEY_DEVICE) || "").trim();
+            if (!value) { value = randomDeviceId(); localStorage.setItem(KEY_DEVICE, value); }
+            return value;
+          }
+          function getToken() { return String(localStorage.getItem(KEY_TOKEN) || "").trim(); }
+          function getLastCheck() { return Number(localStorage.getItem(KEY_LAST_CHECK) || 0) || 0; }
+          function saveToken(token) { localStorage.setItem(KEY_TOKEN, token); localStorage.setItem(KEY_LAST_CHECK, String(Date.now())); }
+          function markChecked() { localStorage.setItem(KEY_LAST_CHECK, String(Date.now())); }
+          function clearToken() { localStorage.removeItem(KEY_TOKEN); localStorage.removeItem(KEY_LAST_CHECK); }
+          
+          async function postJson(path, payload) {
+            const request = fetch(`${API_BASE}${path}`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Accept: "application/json" },
+              body: JSON.stringify(payload)
+            }).then(async (response) => {
+              const body = await response.text().catch(() => "");
+              let json = {};
+              try { json = body ? JSON.parse(body) : {}; } catch (_) {}
+              return { ok: response.ok && json?.ok === true, token: String(json?.token || ""),
+                error: String(json?.error || ""), httpCode: response.status };
+            });
+            const timeout = new Promise((resolve) =>
+              setTimeout(() => resolve({ ok:false, error:"network_error", httpCode:0 }), 8500)
+            );
+            try { return await Promise.race([request, timeout]); }
+            catch (_) { return { ok:false, error:"network_error", httpCode:0 }; }
+          }
+          function messageFor(error) {
+            switch (String(error || "")) {
+              case "invalid_code": return "Codul nu este valid.";
+              case "code_blocked": return "Codul este blocat.";
+              case "code_expired": return "Codul a expirat.";
+              case "device_limit": return "Codul a ajuns la limita de 4 dispozitive.";
+              case "invalid_request": return "Codul nu este complet.";
+              case "network_error": return "Nu pot verifica activarea. Verifică internetul.";
+              default: return "Activarea nu a reușit. Încearcă din nou.";
+            }
+          }
+          function injectStyle() {
+            if (document.getElementById("afPlayActivationStyle")) return;
+            const style = document.createElement("style");
+            style.id = "afPlayActivationStyle";
+            style.textContent = `
+              .af-activation-gate{position:fixed;inset:0;z-index:999999;background:
+                radial-gradient(circle at 50% 10%,rgba(216,27,96,.22),transparent 34%),#070707;
+                display:flex;align-items:center;justify-content:center;color:#fff;font-family:Arial,sans-serif}
+              .af-activation-card{width:640px;box-sizing:border-box;padding:48px;border-radius:28px;
+                background:rgba(22,18,21,.96);border:1px solid rgba(255,255,255,.12);
+                box-shadow:0 30px 90px rgba(0,0,0,.55);text-align:center}
+              .af-activation-brand{font-size:48px;font-weight:900;letter-spacing:.08em}
+              .af-activation-subtitle{margin-top:8px;color:#ec70a9;font-size:24px;font-weight:700}
+              .af-activation-card p{margin:24px auto;color:rgba(255,255,255,.7);font-size:20px;line-height:1.45}
+              .af-activation-input{width:100%;height:72px;box-sizing:border-box;border-radius:16px;
+                border:2px solid rgba(255,255,255,.18);background:#090909;color:#fff;text-align:center;
+                font-size:30px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;outline:none}
+              .af-activation-input:focus{border-color:#ec70a9;box-shadow:0 0 0 4px rgba(236,112,169,.2)}
+              .af-activation-error{min-height:28px;margin:14px 0;color:#ff7373;font-size:18px}
+              .af-activation-button{width:100%;height:68px;border:0;border-radius:16px;background:#ec70a9;
+                color:#12080d;font-size:24px;font-weight:900;outline:none}
+              .af-activation-button:focus{box-shadow:0 0 0 5px #fff;transform:scale(1.02)}
+              .af-activation-loading{font-size:24px;color:#fff}
+            `;
+            document.head.appendChild(style);
+          }
+          function sanitize(input) {
+            input.value = String(input.value || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 14);
+          }
+          function showChecking() {
+            injectStyle();
+            document.body.innerHTML = `<div id="afPlayActivationGate" class="af-activation-gate">
+              <div class="af-activation-loading">Verificare AF Play…</div></div>`;
+          }
+          function showForm(message = "") {
+            injectStyle();
+            document.body.innerHTML = `<div id="afPlayActivationGate" class="af-activation-gate">
+              <div class="af-activation-card">
+                <div class="af-activation-brand">AF PLAY</div>
+                <div class="af-activation-subtitle">Activare dispozitiv</div>
+                <p>Introdu codul primit. Doar litere și cifre, fără liniuțe.</p>
+                <input id="afActivationInput" class="af-activation-input" type="text"
+                       maxlength="14" autocomplete="off" spellcheck="false" placeholder="COD ACTIVARE" />
+                <div id="afActivationError" class="af-activation-error">${message}</div>
+                <button id="afActivationButton" class="af-activation-button" type="button">ACTIVEAZĂ</button>
+              </div></div>`;
+            const input = document.getElementById("afActivationInput");
+            const button = document.getElementById("afActivationButton");
+            const errorNode = document.getElementById("afActivationError");
+            input.addEventListener("input", () => { sanitize(input); errorNode.textContent = ""; });
+            input.addEventListener("keydown", (event) => {
+              const code = Number(event.keyCode || 0);
+              if (code === 40) { event.preventDefault(); button.focus(); }
+              else if ([13,23].includes(code) && input.value.length >= 12) { event.preventDefault(); button.click(); }
+            });
+            button.addEventListener("keydown", (event) => {
+              if (Number(event.keyCode || 0) === 38) { event.preventDefault(); input.focus(); }
+            });
+            setTimeout(() => input.focus(), 80);
+            return { input, button, errorNode };
+          }
+          async function waitForActivation(message = "") {
+            const { input, button, errorNode } = showForm(message);
+            return await new Promise((resolve) => {
+              button.onclick = async () => {
+                sanitize(input);
+                if (input.value.length < 12) { errorNode.textContent = "Codul nu este complet."; input.focus(); return; }
+                button.disabled = true; button.textContent = "SE VERIFICĂ…"; errorNode.textContent = "";
+                const reply = await postJson("/v1/activate", { code:input.value, device_id:getDeviceId() });
+                if (reply.ok && reply.token) { saveToken(reply.token); resolve(true); return; }
+                button.disabled = false; button.textContent = "ACTIVEAZĂ";
+                errorNode.textContent = messageFor(reply.error); input.focus();
+              };
+            });
+          }
+          export const AfPlayActivationGate = {
+            async run() {
+              const token = getToken();
+              const lastCheck = getLastCheck();
+              const now = Date.now();
+              if (token && lastCheck > 0 && now - lastCheck < CHECK_INTERVAL_MS) return true;
+              if (token) {
+                showChecking();
+                const reply = await postJson("/v1/check", { token, device_id:getDeviceId() });
+                if (reply.ok) { markChecked(); document.getElementById("afPlayActivationGate")?.remove(); return true; }
+                if (reply.httpCode === 401 || reply.httpCode === 403) {
+                  clearToken();
+                  await waitForActivation("Activarea nu mai este validă. Introdu din nou codul.");
+                  document.getElementById("afPlayActivationGate")?.remove(); return true;
+                }
+                if (lastCheck > 0 && now - lastCheck < OFFLINE_GRACE_MS) {
+                  document.getElementById("afPlayActivationGate")?.remove(); return true;
+                }
+                await waitForActivation(messageFor(reply.error));
+                document.getElementById("afPlayActivationGate")?.remove(); return true;
+              }
+              await waitForActivation("");
+              document.getElementById("afPlayActivationGate")?.remove();
+              return true;
+            }
+          };
+          '''
+          activation = "\n".join(line[10:] if line.startswith("          ") else line for line in activation.splitlines()) + "\n"
+          write("js/afplay/afPlayActivationGate.js", activation)
+
+          replace_once(
+              "js/app.js",
+              'import { PluginRuntime } from "./core/player/pluginRuntime.js";\n',
+              'import { PluginRuntime } from "./core/player/pluginRuntime.js";\n'
+              'import { AfPlayPreset } from "./afplay/afPlayPreset.js";\n'
+              'import { AfPlayActivationGate } from "./afplay/afPlayActivationGate.js";\n'
+          )
+
+          replace_once(
+              "js/app.js",
+              '    await ProfileManager.setActiveProfile(activeProfile.id);\n'
+              '    StartupSyncService.enableProfileScopedSync();',
+              '    await ProfileManager.setActiveProfile(activeProfile.id);\n'
+              '    AfPlayPreset.seedLocalDefaults(activeProfile.id);\n'
+              '    setTimeout(() => {\n'
+              '      void AfPlayPreset.ensureNetworkSources().catch((error) => {\n'
+              '        console.warn("AF Play source preset failed", error);\n'
+              '      });\n'
+              '    }, 300);\n'
+              '    StartupSyncService.enableProfileScopedSync();'
+          )
+
+          replace_once(
+              "js/app.js",
+              'async function bootstrapApp() {\n'
+              '  markBootStage("Rendering application shell");',
+              'async function bootstrapApp() {\n'
+              '  markBootStage("AF Play activation");\n'
+              '  await AfPlayActivationGate.run();\n'
+              '  markBootStage("Rendering application shell");'
+          )
+
+          replace_once(
+              "js/app.js",
+              '  Platform.init();\n'
+              '  setupPluginServiceLifecycle();',
+              '  Platform.init();\n'
+              '  setupPluginServiceLifecycle();\n'
+              '  AfPlayPreset.seedLocalDefaults("1");\n'
+              '  setTimeout(() => {\n'
+              '    void AfPlayPreset.ensureNetworkSources().catch((error) => {\n'
+              '      console.warn("AF Play startup sources failed", error);\n'
+              '    });\n'
+              '  }, 800);'
+          )
+
+          live_tv = r'''import { Router } from "../../navigation/router.js";
+          import { ScreenUtils } from "../../navigation/screen.js";
+          
+          const DEFAULT_PLAYLIST_URL = __PLAYLIST_URL__;
+          const GRID_COLUMNS = 6;
+          
+          function escapeHtml(value = "") {
+            return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+              .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+          }
+          function normalizeCategory(value = "") {
+            return String(value).toLowerCase()
+              .normalize?.("NFD").replace(/[\u0300-\u036f]/g, "")
+              .replace(/[^a-z0-9&]+/g, " ").replace(/\s+/g, " ").trim() || "";
+          }
+          function canonicalTvCategory(value = "") {
+            const key = normalizeCategory(value);
+            if (["general&news","general news","general stiri","stiri","news","general"].includes(key)) return "General & Știri";
+            if (["sport premium","sports premium"].includes(key)) return "Sport Premium";
+            if (["sport","sports"].includes(key)) return "Sport";
+            if (key === "premium") return "Premium";
+            if (["film","filme","movie","movies"].includes(key)) return "Filme";
+            if (["educatie","educational","education"].includes(key)) return "Educație";
+            if (["copii","kids","kid","desene"].includes(key)) return "Copii";
+            if (["muzica","music"].includes(key)) return "Muzică";
+            if (["religie","religion","religious"].includes(key)) return "Religie";
+            if (["international","internationale","internationale tv"].includes(key)) return "Internaționale";
+            if (key === "lifestyle") return "Lifestyle";
+            if (["documentare","documentary","documentaries"].includes(key)) return "Documentare";
+            if (["local","locale","regional","regionale"].includes(key)) return "Locale";
+            if (["altele","other","others"].includes(key)) return "Altele";
+            return "";
+          }
+          function categoryPriority(name = "") {
+            const order = ["General & Știri","Sport","Sport Premium","Premium","Filme","Documentare",
+              "Educație","Copii","Muzică","Lifestyle","Religie","Internaționale","Locale","Altele"];
+            const i = order.indexOf(name);
+            return i < 0 ? 999 : i;
+          }
+          function attr(line, key) {
+            const match = String(line || "").match(new RegExp(`${key}="([^"]*)"`, "i"));
+            return match ? match[1] : "";
+          }
+          function qualityScore(value = "") {
+            const q = String(value || "").toLowerCase();
+            if (q.includes("4k") || q.includes("uhd") || q.includes("2160")) return 500;
+            if (q.includes("1080") || q.includes("fhd")) return 400;
+            if (q.includes("720") || q === "hd" || q.includes(" hd")) return 300;
+            if (q.includes("576") || q.includes("480")) return 200;
+            if (q.includes("sd")) return 100;
+            return 50;
+          }
+          function bestLink(links = []) {
+            return [...(Array.isArray(links) ? links : [])]
+              .filter((link) => /^https?:\/\//i.test(String(link?.url || "")))
+              .sort((a,b) => qualityScore(b?.quality) - qualityScore(a?.quality))[0] || null;
+          }
+          function parseJsonPlaylist(text) {
+            const root = JSON.parse(text);
+            const channels = Array.isArray(root) ? root : Array.isArray(root.channels) ? root.channels : [];
+            const categoryById = {};
+            if (root && Array.isArray(root.categories)) {
+              root.categories.forEach((category) => {
+                const title = canonicalTvCategory(category?.title || category?.name || "");
+                if (!title) return;
+                const ids = Array.isArray(category?.channelIds) ? category.channelIds : [];
+                ids.forEach((id) => {
+                  const key = String(id);
+                  if (!categoryById[key] || categoryPriority(title) < categoryPriority(categoryById[key])) {
+                    categoryById[key] = title;
+                  }
+                });
+              });
+            }
+            return channels.map((channel,index) => {
+              const id = String(channel.id ?? channel.channelId ?? `json-${index}`);
+              const name = String(channel.channelName || channel.name || `Canal ${index+1}`).trim();
+              const logo = String(channel.channelImage || channel.logo || "").trim();
+              const ownCategories = Array.isArray(channel.categories) ? channel.categories : [];
+              const ownCategory = ownCategories.map(canonicalTvCategory).find(Boolean) ||
+                canonicalTvCategory(channel.category) || canonicalTvCategory(channel.group) ||
+                canonicalTvCategory(channel.groupTitle);
+              const group = categoryById[id] || ownCategory || "Altele";
+              const rawLinks = Array.isArray(channel.channelLinks) ? channel.channelLinks :
+                Array.isArray(channel.links) ? channel.links :
+                channel.url ? [{url:channel.url, quality:channel.quality || "Auto"}] : [];
+              const links = rawLinks.map((link) => typeof link === "string" ?
+                {url:link, quality:"Auto", contentHost:""} :
+                {url:String(link?.url || "").trim(), quality:String(link?.quality || "Auto").trim(),
+                 contentHost:String(link?.contentHost || link?.host || "").trim()})
+                .filter((link) => /^https?:\/\//i.test(link.url))
+                .sort((a,b) => qualityScore(b.quality) - qualityScore(a.quality));
+              return links.length ? {id,name,logo,group,links} : null;
+            }).filter(Boolean);
+          }
+          function parseM3uPlaylist(text) {
+            const channels=[]; let name=""; let logo=""; let group="Altele"; let index=0;
+            String(text || "").split(/\r?\n/).forEach((rawLine) => {
+              const line=rawLine.trim(); if (!line) return;
+              if (/^#EXTINF/i.test(line)) {
+                name=line.includes(",") ? line.slice(line.lastIndexOf(",")+1).trim() : `Canal ${index+1}`;
+                logo=attr(line,"tvg-logo"); group=canonicalTvCategory(attr(line,"group-title")) || "Altele"; return;
+              }
+              if (!line.startsWith("#") && /^https?:\/\//i.test(line)) {
+                channels.push({id:`m3u-${index++}`,name:name || `Canal ${index}`,logo,group,
+                  links:[{url:line,quality:"Auto",contentHost:""}]});
+                name=""; logo=""; group="Altele";
+              }
+            });
+            return channels;
+          }
+          function parsePlaylist(text) {
+            const clean=String(text || "").trim();
+            if (!clean) return [];
+            return clean.startsWith("{") || clean.startsWith("[") ? parseJsonPlaylist(clean) : parseM3uPlaylist(clean);
+          }
+          function focusNode(container,node) {
+            if (!node) return;
+            container.querySelectorAll(".focusable.focused").forEach((item) => item.classList.remove("focused"));
+            node.classList.add("focused");
+            try { node.focus({preventScroll:true}); } catch (_) { node.focus(); }
+            node.scrollIntoView?.({block:"nearest",inline:"nearest"});
+          }
+          function centerX(node) {
+            const r=node?.getBoundingClientRect?.(); return r ? r.left + r.width/2 : 0;
+          }
+          function closestByX(reference,nodes=[]) {
+            if (!reference || !nodes.length) return nodes[0] || null;
+            const x=centerX(reference);
+            return nodes.reduce((best,node) => !best || Math.abs(centerX(node)-x) < Math.abs(centerX(best)-x) ? node : best, null);
+          }
+          
+          export const LiveTvScreen = {
+            container:null, channels:[], selectedGroup:"Toate", status:"", keyHandler:null,
+            async mount() {
+              this.container=document.getElementById("liveTv");
+              ScreenUtils.show(this.container);
+              this.status="Se încarcă lista TV…"; this.render();
+              try {
+                const response=await fetch(DEFAULT_PLAYLIST_URL,{cache:"no-store"});
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                this.channels=parsePlaylist(await response.text());
+                this.status=`${this.channels.length} canale`;
+              } catch (error) {
+                console.warn("AF Play Live TV load failed",error);
+                this.channels=[]; this.status="Lista TV nu este disponibilă.";
+              }
+              this.selectedGroup="Toate"; this.render(); this.bindKeys();
+              requestAnimationFrame(() => focusNode(this.container,
+                this.container.querySelector(".af-tv-group.selected") || this.container.querySelector(".af-tv-card")));
+            },
+            cleanup() {
+              if (this.keyHandler) document.removeEventListener("keydown",this.keyHandler,true);
+              this.keyHandler=null; ScreenUtils.hide(this.container); this.container=null;
+            },
+            groups() {
+              const groups=[...new Set(this.channels.map((c) => c.group).filter(Boolean))]
+                .sort((a,b) => categoryPriority(a)-categoryPriority(b) || a.localeCompare(b));
+              return ["Toate",...groups];
+            },
+            visible() {
+              return this.selectedGroup==="Toate" ? this.channels : this.channels.filter((c) => c.group===this.selectedGroup);
+            },
+            play(channel) {
+              const selected=bestLink(channel.links); if (!selected) return;
+              const candidates=channel.links.map((link,index) => ({
+                id:`${channel.id}:${index}`,url:link.url,name:`${channel.name} · ${link.quality || "Auto"}`,
+                title:`${channel.name} · ${link.quality || "Auto"}`,addonName:link.contentHost || "AF Play TV"
+              }));
+              Router.navigate("player",{
+                streamUrl:selected.url,itemId:`livetv:${channel.id}`,itemType:"live",videoId:`livetv:${channel.id}`,
+                playerTitle:channel.name,playerSubtitle:channel.group,streamCandidates:candidates,
+                preferredStreamId:candidates.find((item) => item.url===selected.url)?.id || candidates[0]?.id || "",
+                returnToStreamOnBack:false,returnToHomeOnBack:false
+              });
+            },
+            render() {
+              if (!this.container) return;
+              const groups=this.groups(), visible=this.visible();
+              this.container.innerHTML=`<div class="af-tv-shell">
+                <header class="af-tv-header"><div><div class="af-tv-eyebrow">AF PLAY TV</div>
+                <div class="af-tv-title-row"><h1>TV</h1><span>${escapeHtml(this.status)}</span></div></div></header>
+                <div class="af-tv-groups" data-zone="groups">
+                  ${groups.map((group,index) => `<button class="af-tv-group focusable${group===this.selectedGroup ? " selected" : ""}"
+                    data-action="group" data-zone="groups" data-index="${index}" data-group="${escapeHtml(group)}">${escapeHtml(group)}</button>`).join("")}
+                </div>
+                <div class="af-tv-grid" data-zone="channels">
+                  ${visible.map((channel,index) => {
+                    const link=bestLink(channel.links);
+                    return `<button class="af-tv-card focusable" data-action="play" data-zone="channels"
+                      data-index="${index}" data-id="${escapeHtml(channel.id)}">
+                      <span class="af-tv-logo-wrap">${channel.logo ? `<img src="${escapeHtml(channel.logo)}" alt="" loading="lazy" />` :
+                        `<span class="af-tv-logo-fallback">TV</span>`}</span>
+                      <span class="af-tv-card-copy"><strong>${escapeHtml(channel.name)}</strong>
+                      <small>${escapeHtml(channel.group)} · ${escapeHtml(link?.quality || "Auto")}</small></span></button>`;
+                  }).join("")}
+                </div></div>`;
+              this.container.querySelectorAll("[data-action='group']").forEach((node) => {
+                node.onclick=() => {
+                  this.selectedGroup=node.dataset.group || "Toate"; this.render();
+                  requestAnimationFrame(() => focusNode(this.container,this.container.querySelector(".af-tv-group.selected")));
+                };
+              });
+              this.container.querySelectorAll("[data-action='play']").forEach((node) => {
+                node.onclick=() => {
+                  const channel=this.channels.find((item) => String(item.id)===String(node.dataset.id));
+                  if (channel) this.play(channel);
+                };
+              });
+              ScreenUtils.indexFocusables(this.container);
+            },
+            moveFocus(code) {
+              const current=this.container.querySelector(".focusable.focused") || document.activeElement ||
+                this.container.querySelector(".af-tv-group.selected");
+              if (!current) return;
+              const zone=String(current.dataset?.zone || "");
+              const groups=Array.from(this.container.querySelectorAll(".af-tv-group"));
+              const cards=Array.from(this.container.querySelectorAll(".af-tv-card"));
+              if (zone==="groups") {
+                const index=Math.max(0,groups.indexOf(current));
+                if (code===37 && index>0) return focusNode(this.container,groups[index-1]);
+                if (code===39 && index<groups.length-1) return focusNode(this.container,groups[index+1]);
+                if (code===40 && cards.length) return focusNode(this.container,closestByX(current,cards.slice(0,GRID_COLUMNS)));
+                return;
+              }
+              if (zone==="channels") {
+                const index=Math.max(0,cards.indexOf(current));
+                if (code===37 && index%GRID_COLUMNS>0) return focusNode(this.container,cards[index-1]);
+                if (code===39 && index%GRID_COLUMNS<GRID_COLUMNS-1 && cards[index+1]) return focusNode(this.container,cards[index+1]);
+                if (code===38) {
+                  if (index<GRID_COLUMNS) return focusNode(this.container,closestByX(current,groups) || this.container.querySelector(".af-tv-group.selected"));
+                  return focusNode(this.container,cards[index-GRID_COLUMNS]);
+                }
+                if (code===40 && cards[index+GRID_COLUMNS]) return focusNode(this.container,cards[index+GRID_COLUMNS]);
+              }
+            },
+            bindKeys() {
+              this.keyHandler=(event) => {
+                if (Router.getCurrent()!=="liveTv") return;
+                const code=Number(event?.keyCode || 0);
+                if ([8,27,461,10009].includes(code)) { event.preventDefault?.(); Router.back(); return; }
+                if ([37,38,39,40].includes(code)) { event.preventDefault?.(); event.stopPropagation?.(); this.moveFocus(code); return; }
+                if ([13,23].includes(code)) {
+                  const node=this.container.querySelector(".focusable.focused") || document.activeElement;
+                  if (node?.click) { event.preventDefault?.(); node.click(); }
+                }
+              };
+              document.addEventListener("keydown",this.keyHandler,true);
+            }
+          };
+          '''
+          live_tv = "\n".join(line[10:] if line.startswith("          ") else line for line in live_tv.splitlines()) + "\n"
+          live_tv = live_tv.replace("__PLAYLIST_URL__", repr(PLAYLIST_URL))
+          write("js/ui/screens/livetv/liveTvScreen.js", live_tv)
+
+          replace_once(
+              "js/bootstrap/renderAppShell.js",
+              '    <div id="library" class="screen"></div>\n    <div id="search" class="screen"></div>',
+              '    <div id="library" class="screen"></div>\n    <div id="liveTv" class="screen"></div>\n    <div id="search" class="screen"></div>'
+          )
+
+          replace_once(
+              "js/ui/navigation/router.js",
+              'import { LibraryScreen } from "../screens/library/libraryScreen.js";\n',
+              'import { LibraryScreen } from "../screens/library/libraryScreen.js";\nimport { LiveTvScreen } from "../screens/livetv/liveTvScreen.js";\n'
+          )
+
+          replace_once(
+              "js/ui/navigation/router.js",
+              '    library: LibraryScreen,\n    search: SearchScreen,',
+              '    library: LibraryScreen,\n    liveTv: LiveTvScreen,\n    search: SearchScreen,'
+          )
+
+          sidebar_path = "js/ui/components/sidebarNavigation.js"
+          sidebar = read(sidebar_path)
+
+          # Insert TV immediately before Settings. Do not depend on the
+          # indentation of a multi-line Python literal inside the workflow.
+          settings_action = '    action: "gotoSettings",'
+          settings_pos = sidebar.find(settings_action)
+          if settings_pos < 0:
+              raise SystemExit("Sidebar Settings action missing")
+          settings_block_start = sidebar.rfind('  {\n', 0, settings_pos)
+          if settings_block_start < 0:
+              raise SystemExit("Sidebar Settings block start missing")
+
+          tv_item = (
+              '  {\n'
+              '    action: "gotoLiveTv",\n'
+              '    route: "liveTv",\n'
+              '    label: "TV",\n'
+              '    iconType: "svg",\n'
+              '    viewBox: "0 0 24 24",\n'
+              '    iconMarkup:\n'
+              '      \'<path d="M4 5h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-6v2h-4v-2H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Zm0 2v10h16V7H4Zm4 2.2 7 2.8-7 2.8V9.2Z"/>\'\n'
+              '  },\n'
+          )
+          sidebar = sidebar[:settings_block_start] + tv_item + sidebar[settings_block_start:]
+          write(sidebar_path, sidebar)
+
+          replace_once(
+              sidebar_path,
+              'function itemLabel(item) {\n  return t(item?.labelKey, {}, String(item?.label || item?.route || ""));\n}',
+              'function itemLabel(item) {\n  if (!item?.labelKey) return String(item?.label || item?.route || "");\n  return t(item.labelKey, {}, String(item?.label || item?.route || ""));\n}'
+          )
+
+          css_path = "css/components.css"
+          css = read(css_path)
+          css += r'''
+          #liveTv{background:radial-gradient(circle at 16% 0%,rgba(216,27,96,.12),transparent 30%),#080808;color:#fff;min-height:100vh}
+          .af-tv-shell{box-sizing:border-box;min-height:1080px;padding:38px 52px 64px}
+          .af-tv-header{display:flex;align-items:center;min-height:92px;margin-bottom:12px}
+          .af-tv-eyebrow{color:#ec70a9;font-size:17px;font-weight:900;letter-spacing:.14em}
+          .af-tv-title-row{display:flex;align-items:baseline;gap:18px}
+          .af-tv-title-row h1{margin:2px 0 0;font-size:48px;line-height:1}
+          .af-tv-title-row span{color:rgba(255,255,255,.58);font-size:20px}
+          .af-tv-groups{display:flex;align-items:center;gap:12px;overflow-x:hidden;padding:10px 6px 20px;min-height:74px}
+          .af-tv-group{flex:0 0 auto!important;width:auto!important;min-width:132px;max-width:260px;height:54px;padding:0 24px;
+           border:1px solid rgba(255,255,255,.14);border-radius:27px;background:rgba(255,255,255,.065);color:#fff;
+           font-size:19px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+          .af-tv-group.selected{background:#ec70a9;border-color:#ec70a9;color:#12080d;font-weight:900}
+          .af-tv-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:13px;padding:2px 4px 40px}
+          .af-tv-card{display:flex;align-items:center;gap:13px;min-width:0;min-height:92px;padding:11px 13px;border-radius:15px;
+           border:1px solid rgba(255,255,255,.09);background:rgba(20,20,20,.94);color:#fff;text-align:left;overflow:hidden}
+          .af-tv-logo-wrap{flex:0 0 58px;width:58px;height:58px;display:flex;align-items:center;justify-content:center;border-radius:11px;background:#050505;overflow:hidden}
+          .af-tv-logo-wrap img{max-width:88%;max-height:88%;object-fit:contain}
+          .af-tv-logo-fallback{color:#ec70a9;font-weight:900}
+          .af-tv-card-copy{min-width:0;display:flex;flex-direction:column;gap:5px}
+          .af-tv-card-copy strong,.af-tv-card-copy small{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+          .af-tv-card-copy strong{font-size:18px}.af-tv-card-copy small{color:rgba(255,255,255,.54);font-size:13px}
+          .af-tv-group.focused,.af-tv-card.focused,.af-tv-group:focus,.af-tv-card:focus{outline:4px solid #ec70a9!important;
+           outline-offset:2px;border-color:#ec70a9;transform:scale(1.025);z-index:2}
+          '''
+          css = "\n".join(line[10:] if line.startswith("          ") else line for line in css.splitlines()) + "\n"
+          write(css_path, css)
+
+          replace_once(
+              "scripts/package-tizen.mjs",
+              'const appName = "Nuvio TV";\nconst defaultTizenPackageId = "NuvioTV001";\nconst defaultTizenAppId = "NuvioTV001.NuvioTV";',
+              'const appName = "AF PLAY TV";\nconst defaultTizenPackageId = "AFPlayTV01";\nconst defaultTizenAppId = "AFPlayTV01.AFPlayTV";'
+          )
+
+          replace_once("index.html", "<title>Nuvio TV</title>", "<title>AF PLAY TV</title>")
+
+          print("AF Play Samsung patch applied")
+          PY
+
+      - name: Verify patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -F 'All-in-One-Nuvio' js/afplay/afPlayPreset.js
+          grep -F 'torrentio.strem.fun' js/afplay/afPlayPreset.js
+          grep -F 'opensubtitles-v3.strem.io' js/afplay/afPlayPreset.js
+          grep -F 'cynex.acasatv.co' js/afplay/afPlayPreset.js
+          grep -F 'niakw/Niakvio' js/afplay/afPlayPreset.js
+          grep -F 'afplay-gateway.smar7y.workers.dev' js/afplay/afPlayActivationGate.js
+          grep -F 'canonicalTvCategory' js/ui/screens/livetv/liveTvScreen.js
+          grep -F 'GRID_COLUMNS = 6' js/ui/screens/livetv/liveTvScreen.js
+          grep -F 'liveTv: LiveTvScreen' js/ui/navigation/router.js
+          grep -F "$PLAYLIST_URL" js/ui/screens/livetv/liveTvScreen.js
+          grep -F 'AF PLAY TV' scripts/package-tizen.mjs
+
+      - name: Build Samsung Tizen WGT
+        env:
+          NUVIO_REQUIRE_LOCAL_PROPERTIES: "1"
+          TIZEN_INCLUDE_ENGINEFS_SERVICE: "1"
+          TIZEN_INCLUDE_PLUGIN_SERVICE: "1"
+        run: npm run package:tizen
+
+      - name: Collect WGT
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          WGT="$(find . -maxdepth 1 -type f -name 'AFPlayTV01_*.wgt' | head -n 1)"
+          test -n "$WGT"
+          cp "$WGT" out/AF-PLAY-TV-Samsung-Tizen-v3.wgt
+          sha256sum out/AF-PLAY-TV-Samsung-Tizen-v3.wgt > out/SHA256SUMS.txt
+          ls -lh out/
+
+      - name: Upload Samsung package
+        uses: actions/upload-artifact@v4
+        with:
+          name: AF-PLAY-TV-Samsung-Tizen-v3
+          path: |
+            out/AF-PLAY-TV-Samsung-Tizen-v3.wgt
+            out/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
